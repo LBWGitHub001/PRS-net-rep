@@ -2,36 +2,36 @@ import os.path
 
 import torch
 from torch import optim
-from Reader import VoxelDataLoader
+from Reader import CombinedDataLoader
+from PRSLoss import *
 
 import PRSNet
 
-voxels_path="./voxels/"
-num_epochs = 10
+voxels_path = "./voxels/"
+num_epochs = 1
+device_name = "cpu"
 
-def train(num_epochs, data_iter):
-    model = PRSNet.PRSNet()
+
+def train(num_epochs, data_iter, model, optimizer, loss_func):
     optimizer = optim.Adam(model.parameters())
     model.train()
     for epoch in range(num_epochs):
-        for x in data_iter:
+        for voxels, points in data_iter:
             optimizer.zero_grad()
-            y1,y2,y3 = model(x)
+            planes, axes = model(voxels)
+            loss = loss_func(planes, points)
 
 
 if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if torch.mps.is_available():
-        device = torch.device("mps")
-
-    dataloader = VoxelDataLoader(
-        voxel_dir=voxels_path,
-        manifest_path=os.path.join(voxels_path,'manifest.json'),
+    dataloader = CombinedDataLoader(
+        intermediate_data_dir='./shapenet_intermediate',
         batch_size=32,
-        num_workers=4,
-        shuffle=True
+        num_workers=0,  # 预加载时设置为 0
+        shuffle=True,
+        device=device_name
     )
 
-    train(num_epochs, dataloader)
-
-
+    model = PRSNet.PRSNet().to(device_name)
+    LossFunc = SymmetryLoss().to(device_name)
+    optimizer = optim.Adam(model.parameters(),lr=0.001)
+    train(num_epochs, dataloader, model, optimizer, LossFunc)

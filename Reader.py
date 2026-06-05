@@ -3,61 +3,112 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import json
 from pathlib import Path
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional
 import os
 
 
-class VoxelDataset(Dataset):
-    """体素数据集（从 .npy 文件加载）"""
+class CombinedDataset(Dataset):
+    """组合数据集 - 加载体素和点云对"""
 
     def __init__(
             self,
-            voxel_dir: str,
-            manifest_path: Optional[str] = None,
+            intermediate_data_dir: str,
             transform: Optional[callable] = None,
             device: str = 'cpu'
     ):
         """
         Args:
-            voxel_dir: 体素文件所在目录
-            manifest_path: manifest.json 路径（可选，用于获取元数据）
+            intermediate_data_dir: 中间数据目录（由 UnifiedShapeNetProcessor 生成）
             transform: 数据变换函数（可选）
             device: 'cpu' 或 'cuda'
         """
-        self.voxel_dir = Path(voxel_dir)
+        self.data_dir = Path(intermediate_data_dir)
         self.device = device
         self.transform = transform
 
-        # 查找所有 .npy 文件
-        self.voxel_files = sorted(self.voxel_dir.glob('voxel_*.npy'))
+        # 加载清单
+        manifest_path = self.data_dir / 'manifest.json'
+        if not manifest_path.exists():
+            raise ValueError(f'在 {intermediate_data_dir} 中没有找到 manifest.json！')
 
-        if len(self.voxel_files) == 0:
-            raise ValueError(f'在 {voxel_dir} 中没有找到 .npy 文件！')
+        with open(manifest_path, 'r') as f:
+            self.manifest = json.load(f)
 
-        # 加载清单（如果存在）
-        self.manifest = None
-        self.category_to_idx = {}
+        self.files = self.manifest['files']
 
-        if manifest_path and Path(manifest_path).exists():
-            with open(manifest_path, 'r') as f:
-                self.manifest = json.load(f)
+        if len(self.files) == 0:
+            raise ValueError(f'清单中没有有效的文件！')
 
-            # 构建类别到索引的映射
-            categories = set()
-            for file_info in self.manifest.get('files', []):
-                categories.add(file_info['category'])
+        # 构建类别映射
+        categories = set()
+        for f in self.files:
+            categories.add(f['category'])
 
-            self.category_to_idx = {cat: idx for idx, cat in enumerate(sorted(categories))}
+        self.category_to_idx = {cat: idx for idx, cat in enumerate(sorted(categories))}
+        self.idx_to_category = {v: k for k, v in self.category_to_idx.items()}
 
-        print(f'✅ 加载了 {len(self.voxel_files)} 个体素文件')
-        if self.category_to_idx:
-            print(f'📂 共有 {len(self.category_to_idx)} 个类别')
+        # 预加载所有数据
+        self._preload_data()
+
+        print(f'✅ 加载了 {len(self.files)} 个模型对')
+        print(f'📂 类别数: {len(self.category_to_idx)}')
+
+    def _preload_data(self):
+        """预加载所有体素和点云数据"""
+        print("🔄 预加载数据...")
+
+        self.voxel_tensors = []
+        self.point_tensors = []
+        self.category_indices = []
+
+        voxel_dir = self.data_dir / 'voxels'
+        point_dir = self.data_dir / 'point_clouds'
+
+        for file_info in self.files:
+            try:
+                # 加载体素
+                voxel_path = voxel_dir / file_info['voxel_file']
+                voxel_data = np.load(voxel_path)
+                voxel_tensor = torch.from_numpy(voxel_data).float()
+                voxel_tensor = voxel_tensor.unsqueeze(0)  # (1, 32, 32, 32)
+
+                # 加载点云
+                point_path = point_dir / file_info['point_file']
+                points_data = np.load(point_path)
+                points_tensor = torch.from_numpy(points_data).float()
+
+                # 获取类别索引
+                category_idx = self.category_to_idx[file_info['category']]
+
+                # 应用变换
+                if self.transform:
+                    voxel_tensor = self.transform(voxel_tensor)
+
+                self.voxel_tensors.append(voxel_tensor)
+                self.point_tensors.append(points_tensor)
+                self.category_indices.append(category_idx)
+
+            except Exception as e:
+                print(f"⚠️  跳过文件 {file_info['voxel_file']}: {str(e)}")
+                continue
+
+        # 栈合并
+        self.voxel_tensors = torch.stack(self.voxel_tensors)  # (N, 1, 32, 32, 32)
+        self.category_tensor = torch.tensor(self.category_indices, dtype=torch.long)
+
+        # 移到设备
+        self.voxel_tensors = self.voxel_tensors.to(self.device)
+        self.category_tensor = self.category_tensor.to(self.device)
+
+        print(f"✅ 预加载完成！")
+        print(f"   体素张量形状: {self.voxel_tensors.shape}")
+        print(f"   内存占用: {self.voxel_tensors.element_size() * self.voxel_tensors.nelement() / 1024**2:.2f} MB")
 
     def __len__(self) -> int:
         """返回数据集大小"""
-        return len(self.voxel_files)
+        return len(self.files)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Optional[int], Optional[str]]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         获取单个样本
 
@@ -65,73 +116,50 @@ class VoxelDataset(Dataset):
             idx: 样本索引
 
         Returns:
-            (voxel_tensor, category_idx, metadata)
+            (voxel_tensor, points_tensor, category_idx)
         """
-        # 1. 加载体素数据
-        voxel_path = self.voxel_files[idx]
-        voxel_data = np.load(voxel_path)  # (32, 32, 32)
+        voxel = self.voxel_tensors[idx]  # (1, 32, 32, 32)
+        points = self.point_tensors[idx]  # (num_samples, 3)
 
-        # 2. 转换为 PyTorch 张量
-        voxel_tensor = torch.from_numpy(voxel_data).float()
-        voxel_tensor = voxel_tensor.unsqueeze(0)  # (1, 32, 32, 32) - 添加通道维度
-
-        # 3. 获取类别标签（如果有清单）
-        category_idx = None
-        category_label = None
-
-        if self.manifest:
-            # 从文件名解析类别
-            filename = voxel_path.stem  # voxel_000000_02691156_1a04e3ea
-            parts = filename.split('_')
-            if len(parts) >= 3:
-                category_label = parts[2]
-                category_idx = self.category_to_idx.get(category_label, -1)
-
-        # 4. 应用变换（如果有）
-        if self.transform:
-            voxel_tensor = self.transform(voxel_tensor)
-
-        # 5. 移动到指定设备
-        voxel_tensor = voxel_tensor.to(self.device)
-
-        return voxel_tensor, category_idx, category_label
+        return voxel, points
 
     def get_category_info(self) -> dict:
         """获取类别信息"""
-        if not self.category_to_idx:
-            return {}
-
         return {
             'num_classes': len(self.category_to_idx),
             'category_to_idx': self.category_to_idx,
-            'idx_to_category': {v: k for k, v in self.category_to_idx.items()}
+            'idx_to_category': self.idx_to_category
         }
 
+    def get_model_info(self, idx: int) -> dict:
+        """获取模型的完整信息"""
+        return self.files[idx]
 
-class VoxelDataLoader:
-    """体素数据加载器（便利类）"""
+
+class CombinedDataLoader:
+    """组合数据加载器"""
 
     def __init__(
             self,
-            voxel_dir: str,
-            manifest_path: Optional[str] = None,
+            intermediate_data_dir: str,
             batch_size: int = 32,
-            num_workers: int = 4,
+            num_workers: int = 0,
             shuffle: bool = True,
-            pin_memory: bool = True
+            pin_memory: bool = True,
+            device: str = 'cpu'
     ):
         """
         Args:
-            voxel_dir: 体素文件目录
-            manifest_path: manifest.json 路径
+            intermediate_data_dir: 中间数据目录
             batch_size: 批次大小
-            num_workers: 加载数据的工作进程数
+            num_workers: 加载数据的工作进程数（预加载时应为 0）
             shuffle: 是否打乱数据
-            pin_memory: 是否锁定内存（GPU 训练时推荐）
+            pin_memory: 是否锁定内存
+            device: 'cpu' 或 'cuda'
         """
-        self.dataset = VoxelDataset(
-            voxel_dir=voxel_dir,
-            manifest_path=manifest_path,
+        self.dataset = CombinedDataset(
+            intermediate_data_dir=intermediate_data_dir,
+            device=device
         )
 
         self.dataloader = DataLoader(
@@ -139,9 +167,8 @@ class VoxelDataLoader:
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
-            pin_memory=pin_memory
+            pin_memory=pin_memory and device == 'cuda'
         )
-
 
     def __iter__(self):
         return iter(self.dataloader)
@@ -161,19 +188,27 @@ if __name__ == '__main__':
     print("1. 基本使用")
     print("=" * 80)
 
-    dataset = VoxelDataset(
-        voxel_dir='./voxels',
-        manifest_path='./voxels/manifest.json',
+    dataset = CombinedDataset(
+        intermediate_data_dir='./shapenet_intermediate',
         device='cpu'
     )
 
     # 获取单个样本
-    voxel, category_idx, category_label = dataset[0]
-    print(f'单个样本:')
+    voxel, points, category = dataset[0]
+    print(f'\n单个样本:')
     print(f'  体素张量形状: {voxel.shape}')  # (1, 32, 32, 32)
-    print(f'  类别索引: {category_idx}')
-    print(f'  类别标签: {category_label}')
-    print(f'  数据类型: {voxel.dtype}')
+    print(f'  点云张量形状: {points.shape}')  # (num_samples, 3)
+    print(f'  类别索引: {category}')
+    print(f'  体素数据类型: {voxel.dtype}')
+    print(f'  点云数据类型: {points.dtype}')
+
+    # 获取模型信息
+    model_info = dataset.get_model_info(0)
+    print(f'\n模型信息:')
+    print(f'  模型ID: {model_info["model_id"]}')
+    print(f'  类别: {model_info["category"]}')
+    print(f'  体素占有率: {model_info["voxel_occupancy"]:.2f}%')
+    print(f'  点云数量: {model_info["point_count"]}')
     print()
 
     # 2. 使用 DataLoader（推荐）
@@ -181,36 +216,36 @@ if __name__ == '__main__':
     print("2. 使用 DataLoader")
     print("=" * 80)
 
-    dataloader = VoxelDataLoader(
-        voxel_dir='./voxels',
-        manifest_path='./voxels/manifest.json',
+    dataloader = CombinedDataLoader(
+        intermediate_data_dir='./shapenet_intermediate',
         batch_size=32,
-        num_workers=4,
-        shuffle=True
+        num_workers=0,  # 预加载时设置为 0
+        shuffle=True,
+        device='cpu'
     )
 
     # 获取类别信息
     category_info = dataloader.get_category_info()
-    print(f'类别信息:')
+    print(f'\n类别信息:')
     print(f'  总类别数: {category_info["num_classes"]}')
     print(f'  类别映射: {list(category_info["category_to_idx"].items())[:5]}...')
     print()
 
     # 迭代加载数据
     print("迭代数据:")
-    for batch_idx, (voxels, categories, labels) in enumerate(dataloader):
-        print(f'  批次 {batch_idx}:')
-        print(f'    体素张量: {voxels.shape}')  # (32, 1, 32, 32, 32)
-        print(f'    类别索引: {categories}')
-        print(f'    类别标签: {labels}')
+    for batch_idx, (batch_voxels, batch_points, batch_categories) in enumerate(dataloader):
+        print(f'\n  批次 {batch_idx}:')
+        print(f'    体素批次: {batch_voxels.shape}')  # (32, 1, 32, 32, 32)
+        print(f'    点云批次: {batch_points.shape}')  # (32, num_samples, 3)
+        print(f'    类别索引: {batch_categories}')
 
         if batch_idx == 2:  # 仅显示前 3 个批次
             break
     print()
 
-    # 4. 创建训练和验证集
+    # 3. 创建训练和验证集
     print("=" * 80)
-    print("4. 划分训练/验证集")
+    print("3. 划分训练/验证集")
     print("=" * 80)
 
     from torch.utils.data import random_split
@@ -224,28 +259,67 @@ if __name__ == '__main__':
         train_dataset,
         batch_size=32,
         shuffle=True,
-        num_workers=4
+        num_workers=0
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=32,
         shuffle=False,
-        num_workers=4
+        num_workers=0
     )
 
-    print(f'训练集大小: {len(train_dataset)}')
+    print(f'\n训练集大小: {len(train_dataset)}')
     print(f'验证集大小: {len(val_dataset)}')
     print()
 
-    # 5. 检查数据
+    # 4. 检查数据
     print("=" * 80)
-    print("5. 数据检查")
+    print("4. 数据检查")
     print("=" * 80)
 
-    batch_voxels, batch_categories, batch_labels = next(iter(train_loader))
-    print(f'批次统计:')
-    print(f'  形状: {batch_voxels.shape}')
-    print(f'  数据类型: {batch_voxels.dtype}')
-    print(f'  值范围: [{batch_voxels.min():.2f}, {batch_voxels.max():.2f}]')
-    print(f'  非零体素: {(batch_voxels > 0).sum().item()} / {batch_voxels.numel()}')
+    batch_voxels, batch_points, batch_categories = next(iter(train_loader))
+
+    print(f'\n批次统计:')
+    print(f'  体素形状: {batch_voxels.shape}')
+    print(f'  体素数据类型: {batch_voxels.dtype}')
+    print(f'  体素值范围: [{batch_voxels.min():.2f}, {batch_voxels.max():.2f}]')
+    print(f'  体素非零: {(batch_voxels > 0).sum().item()} / {batch_voxels.numel()}')
+
+    print(f'\n  点云形状: {batch_points.shape}')
+    print(f'  点云数据类型: {batch_points.dtype}')
+    print(f'  点云坐标范围:')
+    print(f'    X: [{batch_points[:, :, 0].min():.4f}, {batch_points[:, :, 0].max():.4f}]')
+    print(f'    Y: [{batch_points[:, :, 1].min():.4f}, {batch_points[:, :, 1].max():.4f}]')
+    print(f'    Z: [{batch_points[:, :, 2].min():.4f}, {batch_points[:, :, 2].max():.4f}]')
+
+    print(f'\n  类别: {batch_categories}')
+
+    # 5. GPU 支持
+    print("\n" + "=" * 80)
+    print("5. GPU 支持示例")
+    print("=" * 80)
+
+    if torch.cuda.is_available():
+        print(f'\n✅ 检测到 GPU: {torch.cuda.get_device_name(0)}')
+
+        gpu_dataset = CombinedDataset(
+            intermediate_data_dir='./shapenet_intermediate',
+            device='cuda'
+        )
+
+        gpu_loader = CombinedDataLoader(
+            intermediate_data_dir='./shapenet_intermediate',
+            batch_size=64,
+            device='cuda'
+        )
+
+        voxel, points, category = gpu_dataset[0]
+        print(f'  体素设备: {voxel.device}')
+        print(f'  点云设备: {points.device}')
+
+        batch_voxels, batch_points, _ = next(iter(gpu_loader))
+        print(f'  批次体素设备: {batch_voxels.device}')
+        print(f'  批次点云设备: {batch_points.device}')
+    else:
+        print('\n⚠️  未检测到 GPU，使用 CPU')

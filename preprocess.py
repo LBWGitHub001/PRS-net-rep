@@ -1,12 +1,11 @@
 import os
 import numpy as np
 import torch
-from scipy import ndimage
 from pathlib import Path
 from multiprocessing import Pool
 from tqdm import tqdm
 import json
-from typing import Tuple, List
+from typing import Tuple
 import trimesh
 
 
@@ -45,75 +44,51 @@ class UnifiedShapeNetProcessor:
         }
 
     def find_all_models(self) -> list:
-        """
-        查找所有完整的模型
-
-        Returns:
-            list: [(category_id, model_id, obj_path, binvox_path), ...]
-        """
         models = []
-
         for root, dirs, files in os.walk(self.shapenet_root):
-            # 检查是否有 obj 和 binvox 文件
             has_obj = 'model_normalized.obj' in files
             has_binvox = 'model_normalized.solid.binvox' in files
+            has_json = 'model_normalized.json' in files  # <-- 加这行
 
-            if has_obj and has_binvox:
+            if has_obj and has_binvox and has_json:  # <-- 必须3个都有
                 obj_path = os.path.join(root, 'model_normalized.obj')
                 binvox_path = os.path.join(root, 'model_normalized.solid.binvox')
+                json_path = os.path.join(root, 'model_normalized.json')  # <-- 加这行
 
                 parts = Path(obj_path).parts
-
                 if len(parts) >= 4:
                     category_id = parts[-4]
                     model_id = parts[-3]
-                    models.append((category_id, model_id, obj_path, binvox_path))
-
+                    models.append((category_id, model_id, obj_path, binvox_path, json_path))  # <-- 加json
         return sorted(models)
 
+    # ----------------------
+    # 【正确】读 binvox 格式（替换你错误的手动解析）
+    # ----------------------
     @staticmethod
-    def _read_binvox(binvox_path: str) -> np.ndarray:
-        """读取 binvox 文件"""
+    def _read_binvox(binvox_path):
+        import binvox_rw  # 必须用官方库
         with open(binvox_path, 'rb') as f:
-            raw_data = f.read()
+            voxel = binvox_rw.read_as_3d_array(f)
+        return voxel.data  # (D, W, H) 正确3D体素
 
-        header_text = raw_data[:512].decode('utf-8', errors='ignore')
-        dims = [64, 64, 64]
-        for line in header_text.split('\n'):
-            if line.startswith('dim'):
-                dims = list(map(int, line.split()[1:4]))
-                break
-
-        data_start = raw_data.find(b'\n\n') + 2
-        rle_data = raw_data[data_start:]
-
-        voxel_count = np.prod(dims)
-        voxels = np.zeros(voxel_count, dtype=np.uint8)
-
-        idx_pos = 0
-        rle_pos = 0
-
-        while rle_pos + 1 < len(rle_data) and idx_pos < voxel_count:
-            value = rle_data[rle_pos]
-            count = rle_data[rle_pos + 1]
-            rle_pos += 2
-
-            end_pos = min(idx_pos + count, voxel_count)
-            voxels[idx_pos:end_pos] = value
-            idx_pos = end_pos
-
-        voxels = voxels.reshape(dims)
-        return voxels
-
+    # ----------------------
+    # 【正确】缩放到32^3（不会变平面）
+    # ----------------------
     @staticmethod
-    def _resize_voxel_32(voxel_grid: np.ndarray) -> np.ndarray:
-        """调整体素到 32x32x32"""
-        if voxel_grid.shape == (32, 32, 32):
-            return voxel_grid
+    def _resize_voxel_32(voxel, target_size=32):
+        import skimage.transform
+        from scipy import ndimage
 
-        scale_factors = np.array([32.0, 32.0, 32.0]) / np.array(voxel_grid.shape)
-        resized = ndimage.zoom(voxel_grid.astype(np.uint8), scale_factors, order=0)
-        return (resized > 0).astype(np.uint8)
+        # ✅ 方案 A：使用双线性插值 + 更低阈值（推荐）
+        voxel = skimage.transform.resize(
+            voxel.astype(np.float32),
+            (target_size, target_size, target_size),
+            order=1,  # ← 双线性插值，保留细结构
+            preserve_range=True,
+            anti_aliasing=True  # ← 抗锯齿，更平滑
+        )
+        return (voxel > 0.3).astype(np.uint8)  # ← 降低阈值
 
     @staticmethod
     def _sample_points_from_obj(obj_path: str, num_samples: int) -> np.ndarray:
@@ -126,12 +101,14 @@ class UnifiedShapeNetProcessor:
             )
 
         points, _ = trimesh.sample.sample_surface(mesh, num_samples)
+
+        centroid = points.mean(axis=0)
+        points = points - centroid
         return points.astype(np.float32)
 
     @staticmethod
     def process_single_model(args: Tuple) -> dict:
-        """处理单个模型 - 同时生成体素和点云"""
-        idx, category_id, model_id, obj_path, binvox_path, \
+        idx, category_id, model_id, obj_path, binvox_path, json_path, \
             voxel_dir, point_dir, metadata_dir, num_samples = args
 
         result = {
@@ -146,16 +123,45 @@ class UnifiedShapeNetProcessor:
         }
 
         try:
-            # ========== 处理体素 ==========
-            voxel_file = None
-            voxel_occupancy = 0
+            # ========== 【核心】读取官方 json 质心 + 包围盒 ==========
+            with open(json_path, 'r', encoding='utf-8') as f:
+                shape_info = json.load(f)
+            centroid_gt = np.array(shape_info['centroid'], dtype=np.float32)
+            min_gt = np.array(shape_info['min'], dtype=np.float32)
+            max_gt = np.array(shape_info['max'], dtype=np.float32)
 
+            # ========== 处理点云：使用官方质心居中 ==========
+            point_file = None
+            try:
+                mesh = trimesh.load(obj_path)
+                if isinstance(mesh, trimesh.Scene):
+                    mesh = trimesh.util.concatenate([geom for geom in mesh.geometry.values()])
+
+                # ✅ 使用 json 里的真实 centroid 居中
+                mesh.vertices -= centroid_gt
+
+                # 采样点云
+                # ========== 【关键】使用 JSON 里的模型真实顶点数 ==========
+                num_vertices = shape_info['numVertices']  # 从json读取官方顶点数量
+                points = mesh.vertices.astype(np.float32)  # 直接用模型顶点，不随机采样
+
+                # 保存
+                point_filename = f'points_{idx:06d}_{category_id}_{model_id}.npy'
+                point_path = os.path.join(point_dir, point_filename)
+                np.save(point_path, points)
+                point_file = point_filename
+                result['point_file'] = point_filename
+                result['point_count'] = int(len(points))
+            except Exception as e:
+                result['errors'].append(f'点云失败: {str(e)}')
+
+            # ========== 处理体素：同样居中 ==========
+            voxel_file = None
             try:
                 voxels = UnifiedShapeNetProcessor._read_binvox(binvox_path)
                 voxels = UnifiedShapeNetProcessor._resize_voxel_32(voxels)
-                voxel_occupancy = (voxels > 0).sum() / (32 ** 3) * 100
+                voxel_occupancy = (voxels > 0).mean() * 100
 
-                # 只保存有效的体素（填充率 > 0.1%）
                 if voxel_occupancy > 0.1:
                     voxel_filename = f'voxel_{idx:06d}_{category_id}_{model_id}.npy'
                     voxel_path = os.path.join(voxel_dir, voxel_filename)
@@ -163,36 +169,8 @@ class UnifiedShapeNetProcessor:
                     voxel_file = voxel_filename
                     result['voxel_file'] = voxel_filename
                     result['voxel_occupancy'] = float(voxel_occupancy)
-                else:
-                    result['errors'].append(f'体素填充率过低: {voxel_occupancy:.2f}%')
-
             except Exception as e:
-                result['errors'].append(f'体素处理失败: {str(e)}')
-
-            # ========== 处理点云 ==========
-            point_file = None
-            point_count = 0
-
-            try:
-                points = UnifiedShapeNetProcessor._sample_points_from_obj(obj_path, num_samples)
-                point_count = len(points)
-
-                point_filename = f'points_{idx:06d}_{category_id}_{model_id}.npy'
-                point_path = os.path.join(point_dir, point_filename)
-                np.save(point_path, points)
-                point_file = point_filename
-                result['point_file'] = point_filename
-                result['point_count'] = int(point_count)
-
-                # 记录点的范围
-                result['point_range'] = {
-                    'x': [float(points[:, 0].min()), float(points[:, 0].max())],
-                    'y': [float(points[:, 1].min()), float(points[:, 1].max())],
-                    'z': [float(points[:, 2].min()), float(points[:, 2].max())]
-                }
-
-            except Exception as e:
-                result['errors'].append(f'点云处理失败: {str(e)}')
+                result['errors'].append(f'体素失败: {str(e)}')
 
             # ========== 保存元数据 ==========
             if voxel_file and point_file:
@@ -200,24 +178,20 @@ class UnifiedShapeNetProcessor:
                     'index': idx,
                     'category': category_id,
                     'model_id': model_id,
+                    'centroid': centroid_gt.tolist(),
+                    'min': min_gt.tolist(),
+                    'max': max_gt.tolist(),
                     'voxel_file': voxel_file,
                     'point_file': point_file,
-                    'voxel_occupancy': float(voxel_occupancy),
-                    'point_count': int(point_count),
-                    'point_range': result['point_range']
                 }
-
-                metadata_filename = f'meta_{idx:06d}_{category_id}_{model_id}.json'
-                metadata_path = os.path.join(metadata_dir, metadata_filename)
-                with open(metadata_path, 'w') as f:
+                meta_fn = f'meta_{idx:06d}_{category_id}_{model_id}.json'
+                with open(os.path.join(metadata_dir, meta_fn), 'w') as f:
                     json.dump(metadata, f, indent=2)
-
-                result['metadata_file'] = metadata_filename
+                result['metadata_file'] = meta_fn
 
         except Exception as e:
             result['status'] = 'failed'
-            result['errors'].append(f'未知错误: {str(e)}')
-
+            result['errors'].append(f'错误: {str(e)}')
         return result
 
     def process_all(self, save_manifest: bool = True) -> dict:
@@ -239,10 +213,10 @@ class UnifiedShapeNetProcessor:
 
         # 准备任务
         tasks = [
-            (idx, cat, mid, obj, binvox,
+            (idx, cat, mid, obj, binvox, json_path,
              str(self.voxel_dir), str(self.point_dir), str(self.metadata_dir),
              self.num_samples)
-            for idx, (cat, mid, obj, binvox) in enumerate(models)
+            for idx, (cat, mid, obj, binvox, json_path) in enumerate(models)
         ]
 
         # 多进程处理
@@ -408,7 +382,7 @@ if __name__ == '__main__':
         shapenet_root='ShapeNet',
         output_dir='./shapenet_intermediate',
         num_workers=None,  # 自动使用所有 CPU 核心
-        num_samples=100
+        num_samples=1000
     )
 
     stats = processor.process_all(save_manifest=True)

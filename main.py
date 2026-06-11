@@ -18,8 +18,8 @@ def train(num_epochs, data_iter, model, optimizer, loss_func):
     for epoch in range(num_epochs):
         for voxels, points in data_iter:
             optimizer.zero_grad()
-            planes, axes = model(voxels)
-            loss = loss_func(planes, points)
+            planes, quaternions = model(voxels)
+            loss = loss_func(planes, quaternions, points)
 
 
 if __name__ == "__main__":

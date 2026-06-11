@@ -61,13 +61,16 @@ class Predictor(nn.Module):
         y1 = F.leaky_relu(self.fc1_1(conv_result))
         y1 = F.leaky_relu(self.fc1_2(y1))
         y1 = F.leaky_relu(self.fc1_3(y1))
+        y1 = F.normalize(y1)
 
         y2 = F.leaky_relu(self.fc2_1(conv_result))
         y2 = F.leaky_relu(self.fc2_2(y2))
         y2 = F.leaky_relu(self.fc2_3(y2))
+        y2 = F.normalize(y2)
 
         y3 = F.leaky_relu(self.fc3_1(conv_result))
         y3 = F.leaky_relu(self.fc3_2(y3))
         y3 = F.leaky_relu(self.fc3_3(y3))
+        y3 = F.normalize(y3)
 
         return torch.stack((y1, y2, y3), 1)

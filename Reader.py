@@ -39,19 +39,10 @@ class CombinedDataset(Dataset):
         if len(self.files) == 0:
             raise ValueError(f'清单中没有有效的文件！')
 
-        # 构建类别映射
-        categories = set()
-        for f in self.files:
-            categories.add(f['category'])
-
-        self.category_to_idx = {cat: idx for idx, cat in enumerate(sorted(categories))}
-        self.idx_to_category = {v: k for k, v in self.category_to_idx.items()}
-
         # 预加载所有数据
         self._preload_data()
 
         print(f'✅ 加载了 {len(self.files)} 个模型对')
-        print(f'📂 类别数: {len(self.category_to_idx)}')
 
     def _preload_data(self):
         """预加载所有体素和点云数据"""
@@ -59,7 +50,6 @@ class CombinedDataset(Dataset):
 
         self.voxel_tensors = []
         self.point_tensors = []
-        self.category_indices = []
 
         voxel_dir = self.data_dir / 'voxels'
         point_dir = self.data_dir / 'point_clouds'
@@ -77,16 +67,12 @@ class CombinedDataset(Dataset):
                 points_data = np.load(point_path)
                 points_tensor = torch.from_numpy(points_data).float()
 
-                # 获取类别索引
-                category_idx = self.category_to_idx[file_info['category']]
-
                 # 应用变换
                 if self.transform:
                     voxel_tensor = self.transform(voxel_tensor)
 
                 self.voxel_tensors.append(voxel_tensor)
                 self.point_tensors.append(points_tensor)
-                self.category_indices.append(category_idx)
 
             except Exception as e:
                 print(f"⚠️  跳过文件 {file_info['voxel_file']}: {str(e)}")
@@ -94,11 +80,9 @@ class CombinedDataset(Dataset):
 
         # 栈合并
         self.voxel_tensors = torch.stack(self.voxel_tensors)  # (N, 1, 32, 32, 32)
-        self.category_tensor = torch.tensor(self.category_indices, dtype=torch.long)
 
         # 移到设备
         self.voxel_tensors = self.voxel_tensors.to(self.device)
-        self.category_tensor = self.category_tensor.to(self.device)
 
         print(f"✅ 预加载完成！")
         print(f"   体素张量形状: {self.voxel_tensors.shape}")
@@ -122,14 +106,6 @@ class CombinedDataset(Dataset):
         points = self.point_tensors[idx]  # (num_samples, 3)
 
         return voxel, points
-
-    def get_category_info(self) -> dict:
-        """获取类别信息"""
-        return {
-            'num_classes': len(self.category_to_idx),
-            'category_to_idx': self.category_to_idx,
-            'idx_to_category': self.idx_to_category
-        }
 
     def get_model_info(self, idx: int) -> dict:
         """获取模型的完整信息"""
@@ -176,8 +152,6 @@ class CombinedDataLoader:
     def __len__(self):
         return len(self.dataloader)
 
-    def get_category_info(self):
-        return self.dataset.get_category_info()
 
 
 # ============= 使用示例 =============
@@ -194,11 +168,10 @@ if __name__ == '__main__':
     )
 
     # 获取单个样本
-    voxel, points, category = dataset[0]
+    voxel, points = dataset[0]
     print(f'\n单个样本:')
     print(f'  体素张量形状: {voxel.shape}')  # (1, 32, 32, 32)
     print(f'  点云张量形状: {points.shape}')  # (num_samples, 3)
-    print(f'  类别索引: {category}')
     print(f'  体素数据类型: {voxel.dtype}')
     print(f'  点云数据类型: {points.dtype}')
 
@@ -224,20 +197,12 @@ if __name__ == '__main__':
         device='cpu'
     )
 
-    # 获取类别信息
-    category_info = dataloader.get_category_info()
-    print(f'\n类别信息:')
-    print(f'  总类别数: {category_info["num_classes"]}')
-    print(f'  类别映射: {list(category_info["category_to_idx"].items())[:5]}...')
-    print()
-
     # 迭代加载数据
     print("迭代数据:")
-    for batch_idx, (batch_voxels, batch_points, batch_categories) in enumerate(dataloader):
+    for batch_idx, (batch_voxels, batch_points) in enumerate(dataloader):
         print(f'\n  批次 {batch_idx}:')
         print(f'    体素批次: {batch_voxels.shape}')  # (32, 1, 32, 32, 32)
         print(f'    点云批次: {batch_points.shape}')  # (32, num_samples, 3)
-        print(f'    类别索引: {batch_categories}')
 
         if batch_idx == 2:  # 仅显示前 3 个批次
             break

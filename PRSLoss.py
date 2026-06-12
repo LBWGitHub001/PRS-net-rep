@@ -10,24 +10,26 @@ class SymmetryLoss(nn.Module):
         super(SymmetryLoss, self).__init__()
 
     # plane (B,3,4) quaternion(B,3,4) points(N,3)*B
-    def forward(self, plane, quaternion, points_batch):
+    def forward(self, plane, quaternion, points_batch, nearest_idx_maps, nearest_pts_maps, max_min):
         n, d = self.convertToDirection(plane)
-        if isinstance(points_batch, list): # 全部读取
+        if isinstance(points_batch, list):  # 全部读取
             reflect_points = list()
             rotated_points = list()
             if len(points_batch) != plane.shape[0] or len(points_batch) != quaternion.shape[0]:
                 throw_error("输入的维度不对")
             for idx, points in enumerate(points_batch):
                 points = points.unsqueeze(0)
-                reflect_p = self.genReflectPoints(n[idx:idx+1], d[idx:idx+1], points)
-                rotation_p = self.genRotationPoints(quaternion[idx:idx+1], points)
+                reflect_p = self.genReflectPoints(n[idx:idx + 1], d[idx:idx + 1], points)
+                rotation_p = self.genRotationPoints(quaternion[idx:idx + 1], points)
                 reflect_points.append(reflect_p)
                 rotated_points.append(rotation_p)
             return reflect_points, rotated_points
-        elif isinstance(points_batch, torch.Tensor): # 定长采样
+        elif isinstance(points_batch, torch.Tensor):  # 定长采样
             reflect_p = self.genReflectPoints(n, d, points_batch)
             rotation_p = self.genRotationPoints(quaternion, points_batch)
-
+            all_transformed_points = torch.cat([reflect_p, rotation_p], dim=-2)
+            D = self.calc_distances(all_transformed_points, nearest_idx_maps, nearest_pts_maps, max_min)
+            return D
 
     def convertToDirection(self, plane):
         return plane[..., 0:3], plane[..., 3]
@@ -55,11 +57,42 @@ class SymmetryLoss(nn.Module):
             q_ = p * q * p.conjugate()
             rotated_list.append(torch.tensor(quaternion.as_vector_part(q_)))
 
-        rotated_points = torch.stack(rotated_list,dim=-2)
+        rotated_points = torch.stack(rotated_list, dim=-2)
         return rotated_points
 
+    def calc_distances(self, transformed_points, idx_maps, nearest_points_maps, max_min):
+        bbox_max, bbox_min = max_min
+        bbox_max = bbox_max[:, None, None, :]
+        bbox_min = bbox_min[:, None, None, :]
+        size = bbox_max - bbox_min
+        V = 32
+        norm = (transformed_points - bbox_min) / size * V
+        voxel_ijk = torch.floor(norm).clamp(0, V - 1).long()  # (B, N, M, 3) int64
 
-# ===================== 测试 =====================
+        points_axe_list = torch.unbind(transformed_points, dim=-2)
+        voxel_ijk_axe_list = torch.unbind(voxel_ijk, dim=-2)
+
+        distance_sum = 0
+        for points, ijk in zip(points_axe_list, voxel_ijk_axe_list):
+            B, N, _ = ijk.shape
+            nearest_points = torch.zeros(B, N, 3, device=nearest_points_maps.device, dtype=nearest_points_maps.dtype)
+
+            for b in range(B):
+                i = ijk[b, :, 0].long()
+                j = ijk[b, :, 1].long()
+                k = ijk[b, :, 2].long()
+                nearest_points[b] = nearest_points_maps[b, i, j, k]  # (N, 3)
+            # nearest_points 是每个变换后的点对应体素的物体真实表面的最近点
+            distances = points - nearest_points
+            distances = torch.sum(distances * distances, dim=-1).sqrt()
+            min_distance = distances.min(dim=-1).values
+            distance_sum += torch.sum(min_distance, dim=0)
+
+        return distance_sum
+
+    # ===================== 测试 =====================
+
+
 import torch
 import numpy as np
 from PRSLoss import SymmetryLoss
@@ -70,17 +103,17 @@ if __name__ == "__main__":
     Loss = SymmetryLoss()
 
     # ===================== 构造输入 =====================
-    B = 2        # 对称生成器数量
-    M = 3        # 每个生成器的对称操作数
+    B = 2  # 对称生成器数量
+    M = 3  # 每个生成器的对称操作数
 
-    plane = torch.randn(B, M, 4)                           # (B, M, 4)
-    quat = torch.randn(B, M, 4)                            # (B, M, 4)
-    quat = torch.nn.functional.normalize(quat, dim=-1)     # 单位四元数
+    plane = torch.randn(B, M, 4)  # (B, M, 4)
+    quat = torch.randn(B, M, 4)  # (B, M, 4)
+    quat = torch.nn.functional.normalize(quat, dim=-1)  # 单位四元数
 
     # 变长点云：3 个样本，点数各不相同
     points_batch = [
-        torch.randn(80, 3),    # 80 个点
-        torch.randn(120, 3),   # 120 个点
+        torch.randn(80, 3),  # 80 个点
+        torch.randn(120, 3),  # 120 个点
     ]
 
     print("=" * 60)
@@ -123,6 +156,3 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("🏁 全部通过" if all_ok else "❌ 存在形状不匹配")
     print("=" * 60)
-
-
-

@@ -1,3 +1,5 @@
+from math import nan
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -117,7 +119,7 @@ class CombinedDataset(Dataset):
 
         print(f"✅ 预加载完成！")
         print(f"   体素张量形状: {self.voxel_tensors.shape}")
-        print(f"   内存占用: {self.voxel_tensors.element_size() * self.voxel_tensors.nelement() / 1024**2:.2f} MB")
+        print(f"   内存占用: {self.voxel_tensors.element_size() * self.voxel_tensors.nelement() / 1024 ** 2:.2f} MB")
 
     @staticmethod
     def _compute_voxel_nearest(voxel_np, pts_np, bbox_min, bbox_max):
@@ -152,9 +154,9 @@ class CombinedDataset(Dataset):
         idx_3d = idx.astype(np.int32).reshape(V, V, V)
         idx_3d[empty_mask.reshape(V, V, V)] = -1
 
-        # 最近点坐标 (32,32,32,3)，空体素填 0
+        # 最近点坐标 (32,32,32,3)，空体素填 nan
         pts_3d = pts_np[idx].reshape(V, V, V, 3).astype(np.float32)
-        pts_3d[empty_mask.reshape(V, V, V)] = 0.0
+        pts_3d[empty_mask.reshape(V, V, V)] = 0.0 #TODO 到0.0的位置值应该比较大，这里可能是一个隐患
 
         return idx_3d, pts_3d
 
@@ -162,20 +164,13 @@ class CombinedDataset(Dataset):
         """返回数据集大小"""
         return len(self.files)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor,tuple[torch.Tensor, torch.Tensor]]:
-        """
-        获取单个样本
-
-        Args:
-            idx: 样本索引
-
-        Returns:
-            (voxel_tensor, points_tensor, category_idx)
-        """
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, tuple]:
         voxel = self.voxel_tensors[idx]  # (1, 32, 32, 32)
         points = self.point_tensors[idx]  # (num_samples, 3)
+        idx_maps = self.nearest_idx_maps[idx]  # -1表示空体素
+        pts_maps = self.nearest_pts_maps[idx]  # 0.0表示空体素
 
-        return voxel, points, (self.nearest_idx_maps[idx], self.nearest_pts_maps[idx])
+        return voxel, points, idx_maps, pts_maps, (self.bbox_maxs[idx], self.bbox_mins[idx])
 
     def get_model_info(self, idx: int) -> dict:
         """获取模型的完整信息"""
@@ -237,7 +232,6 @@ class CombinedDataLoader:
         voxels = torch.stack([item[0] for item in batch])  # (B, 1, 32, 32, 32)
         points_list = [item[1] for item in batch]  # 保持为 list，不 stack
         return voxels, points_list
-
 
 
 # ============= 使用示例 =============

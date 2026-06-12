@@ -4,6 +4,7 @@ from torch.utils.data import Dataset, DataLoader
 import json
 from pathlib import Path
 from typing import Tuple, Optional
+from scipy.spatial import KDTree
 import os
 
 
@@ -25,6 +26,8 @@ class CombinedDataset(Dataset):
         self.data_dir = Path(intermediate_data_dir)
         self.device = device
         self.transform = transform
+        self.nearest_idx_maps = []
+        self.nearest_pts_maps = []
 
         # 加载清单
         manifest_path = self.data_dir / 'manifest.json'
@@ -50,6 +53,8 @@ class CombinedDataset(Dataset):
 
         self.voxel_tensors = []
         self.point_tensors = []
+        self.bbox_mins = []
+        self.bbox_maxs = []
 
         voxel_dir = self.data_dir / 'voxels'
         point_dir = self.data_dir / 'point_clouds'
@@ -61,6 +66,7 @@ class CombinedDataset(Dataset):
                 voxel_data = np.load(voxel_path)
                 voxel_tensor = torch.from_numpy(voxel_data).float()
                 voxel_tensor = voxel_tensor.unsqueeze(0)  # (1, 32, 32, 32)
+                bboox_min, bboox_max = 0, 0
 
                 # 加载点云
                 point_path = point_dir / file_info['point_file']
@@ -73,6 +79,31 @@ class CombinedDataset(Dataset):
 
                 self.voxel_tensors.append(voxel_tensor)
                 self.point_tensors.append(points_tensor)
+
+                meta_path = self.data_dir / 'metadata' / file_info.get('metadata_file', '')
+                if meta_path.exists():
+                    with open(meta_path, 'r') as mf:
+                        meta = json.load(mf)
+                    bbox_min = np.array(meta['min'], dtype=np.float32)
+                    bbox_max = np.array(meta['max'], dtype=np.float32)
+                    self.bbox_mins.append(bbox_min)
+                    self.bbox_maxs.append(bbox_max)
+                else:
+                    # 回退：用点云范围估算
+                    bbox_min = points_data.min(axis=0)
+                    bbox_max = points_data.max(axis=0)
+                    self.bbox_mins.append(bbox_min.astype(np.float32))
+                    self.bbox_maxs.append(bbox_max.astype(np.float32))
+
+                # ---- 预计算：体素→最近点 ----
+                near_idx, near_pts = self._compute_voxel_nearest(
+                    voxel_data, points_data, bbox_min, bbox_max
+                )
+                near_idx_t = torch.from_numpy(near_idx)  # (32,32,32) int32
+                near_pts_t = torch.from_numpy(near_pts)  # (32,32,32,3) float32
+                self.nearest_idx_maps.append(near_idx_t)
+                self.nearest_pts_maps.append(near_pts_t)
+
 
             except Exception as e:
                 print(f"⚠️  跳过文件 {file_info['voxel_file']}: {str(e)}")
@@ -88,11 +119,50 @@ class CombinedDataset(Dataset):
         print(f"   体素张量形状: {self.voxel_tensors.shape}")
         print(f"   内存占用: {self.voxel_tensors.element_size() * self.voxel_tensors.nelement() / 1024**2:.2f} MB")
 
+    @staticmethod
+    def _compute_voxel_nearest(voxel_np, pts_np, bbox_min, bbox_max):
+        """
+        voxel_np : (32, 32, 32) uint8
+        pts_np   : (N, 3) float32
+        bbox_min : (3,) float32  — metadata 精确包围盒
+        bbox_max : (3,) float32
+        返回:
+          nearest_idx : (32, 32, 32) int32  空体素=-1
+          nearest_pts : (32, 32, 32, 3) float32  空体素=0
+        """
+        V = 32
+        size = bbox_max - bbox_min  # (3,)
+
+        # 体素中心坐标（包围盒空间）
+        coords = (np.arange(V) + 0.5) / V  # (32,)
+        ii, jj, kk = np.meshgrid(coords, coords, coords, indexing='ij')
+        cx = bbox_min[0] + ii * size[0]
+        cy = bbox_min[1] + jj * size[1]
+        cz = bbox_min[2] + kk * size[2]
+        centers = np.stack([cx, cy, cz], axis=-1).reshape(-1, 3)  # (32768, 3)
+
+        # 空体素掩码
+        empty_mask = (voxel_np == 0).reshape(-1)
+
+        # KDTree 查询（只查非空体素以加速）
+        tree = KDTree(pts_np)
+        dist, idx = tree.query(centers, workers=1)
+
+        # 重塑
+        idx_3d = idx.astype(np.int32).reshape(V, V, V)
+        idx_3d[empty_mask.reshape(V, V, V)] = -1
+
+        # 最近点坐标 (32,32,32,3)，空体素填 0
+        pts_3d = pts_np[idx].reshape(V, V, V, 3).astype(np.float32)
+        pts_3d[empty_mask.reshape(V, V, V)] = 0.0
+
+        return idx_3d, pts_3d
+
     def __len__(self) -> int:
         """返回数据集大小"""
         return len(self.files)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor,tuple[torch.Tensor, torch.Tensor]]:
         """
         获取单个样本
 
@@ -105,7 +175,7 @@ class CombinedDataset(Dataset):
         voxel = self.voxel_tensors[idx]  # (1, 32, 32, 32)
         points = self.point_tensors[idx]  # (num_samples, 3)
 
-        return voxel, points
+        return voxel, points, (self.nearest_idx_maps[idx], self.nearest_pts_maps[idx])
 
     def get_model_info(self, idx: int) -> dict:
         """获取模型的完整信息"""

@@ -1,4 +1,5 @@
 import torch
+from numpy.f2py.auxfuncs import throw_error
 from torch import nn
 import numpy as np
 import quaternion
@@ -8,10 +9,25 @@ class SymmetryLoss(nn.Module):
     def __init__(self):
         super(SymmetryLoss, self).__init__()
 
-    def forward(self, plane, quaternion, points):
+    # plane (B,3,4) quaternion(B,3,4) points(N,3)*B
+    def forward(self, plane, quaternion, points_batch):
         n, d = self.convertToDirection(plane)
-        reflect_p = self.genReflectPoints(n, d, points)
-        rotation_p = self.genRotationPoints(quaternion, points)
+        if isinstance(points_batch, list): # 全部读取
+            reflect_points = list()
+            rotated_points = list()
+            if len(points_batch) != plane.shape[0] or len(points_batch) != quaternion.shape[0]:
+                throw_error("输入的维度不对")
+            for idx, points in enumerate(points_batch):
+                points = points.unsqueeze(0)
+                reflect_p = self.genReflectPoints(n[idx:idx+1], d[idx:idx+1], points)
+                rotation_p = self.genRotationPoints(quaternion[idx:idx+1], points)
+                reflect_points.append(reflect_p)
+                rotated_points.append(rotation_p)
+            return reflect_points, rotated_points
+        elif isinstance(points_batch, torch.Tensor): # 定长采样
+            reflect_p = self.genReflectPoints(n, d, points_batch)
+            rotation_p = self.genRotationPoints(quaternion, points_batch)
+
 
     def convertToDirection(self, plane):
         return plane[..., 0:3], plane[..., 3]
@@ -33,58 +49,80 @@ class SymmetryLoss(nn.Module):
         Lquaternions = torch.unbind(Bquaternion, dim=1)
         rotated_list = []
         for quat in Lquaternions:
-            p = quaternion.as_quat_array(quat)
+            p = quaternion.as_quat_array(quat.detach().numpy())
+            p = p[:, np.newaxis]
             q = quaternion.from_vector_part(points)
             q_ = p * q * p.conjugate()
-            rotated_list.append(quaternion.as_vector_part(q_))
+            rotated_list.append(torch.tensor(quaternion.as_vector_part(q_)))
 
-        rotated_points = torch.tensor(rotated_list)
-        return rotated_points.reshape_as(points)
+        rotated_points = torch.stack(rotated_list,dim=-2)
+        return rotated_points
 
+
+# ===================== 测试 =====================
+import torch
+import numpy as np
+from PRSLoss import SymmetryLoss
+import matplotlib.pyplot as plt
 
 if __name__ == "__main__":
+    torch.manual_seed(42)
     Loss = SymmetryLoss()
-    # ── 测试数据 ──
-    n = torch.tensor([[[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]]])  # (1, 3, 3)
-    d = torch.tensor([[-1., -2., -3.]])  # (1, 3)
-    points = torch.tensor([[[0., 0., 0.], [1., 2., 3.]]])  # (1, 2, 3)
 
-    # ── 向量化计算 ──
-    reflect_vec = Loss.genReflectPoints(n, d, points)
+    # ===================== 构造输入 =====================
+    B = 2        # 对称生成器数量
+    M = 3        # 每个生成器的对称操作数
 
-    # ── 手动循环计算 ──
-    B, M, _ = n.shape
-    _, N, _ = points.shape
-    reflect_manual = torch.zeros(B, N, M, 3)
-    for b in range(B):
-        for k in range(N):
-            for i in range(M):
-                ni, di, pk = n[b, i], d[b, i], points[b, k]
-                t = 2 * (ni @ pk + di) / (ni @ ni)
-                reflect_manual[b, k, i] = pk - t * ni
+    plane = torch.randn(B, M, 4)                           # (B, M, 4)
+    quat = torch.randn(B, M, 4)                            # (B, M, 4)
+    quat = torch.nn.functional.normalize(quat, dim=-1)     # 单位四元数
 
-    # ── 比对 ──
-    diff = (reflect_vec - reflect_manual).abs().max().item()
-    print(f"shape: {reflect_vec.shape}  vs  {reflect_manual.shape}")
-    print(f"max diff: {diff:.2e}")
-    print("✅ 一致" if diff < 1e-5 else "❌ 不一致")
+    # 变长点云：3 个样本，点数各不相同
+    points_batch = [
+        torch.randn(80, 3),    # 80 个点
+        torch.randn(120, 3),   # 120 个点
+    ]
 
-    # ===================== 四元数测试开始 =====================
-    # 1. 构造输入
-    Bquat = torch.randn(1, 1, 4)  # 最简单形状 [B=1, 1个四元数, 4]
-    Bquat = torch.nn.functional.normalize(Bquat, dim=-1)  # 单位化
+    print("=" * 60)
+    print("输入信息")
+    print("=" * 60)
+    print(f"  plane 形状:      {list(plane.shape)}")
+    print(f"  quat 形状:       {list(quat.shape)}")
+    print(f"  points_batch 长度: {len(points_batch)}")
+    for i, pts in enumerate(points_batch):
+        print(f"    样本 {i}: {list(pts.shape)}")
 
-    pts = torch.tensor([[[1., 0., 0.]]])  # 点 [1,0,0]
+    # ===================== 调用 forward =====================
+    reflect_list, rotate_list = Loss(plane, quat, points_batch)
 
-    # 2. 你的函数结果
-    out1 = Loss.genRotationPoints(Bquat, pts)
+    # ===================== 验证输出 =====================
+    print("\n" + "=" * 60)
+    print("输出验证")
+    print("=" * 60)
+    print(f"  reflect_list 长度: {len(reflect_list)}")
+    print(f"  rotate_list  长度: {len(rotate_list)}")
 
-    # 3. 手动四元数旋转 (p * v * p*)
-    p = quaternion.as_quat_array(Bquat.numpy())
-    v = quaternion.from_vector_part(pts.numpy())
-    out2 = torch.tensor(quaternion.as_vector_part(p * v * p.conj()))
+    all_ok = True
+    for i, (ref, rot) in enumerate(zip(reflect_list, rotate_list)):
+        N_i = points_batch[i].shape[0]
+        expected_shape = (1, N_i, M, 3)
 
-    # 4. 对比
-    print("你的函数输出：", out1)
-    print("手动计算输出：", out2)
-    print("是否一致：", torch.allclose(out1, out2, atol=1e-6))
+        ok_ref = list(ref.shape) == list(expected_shape)
+        ok_rot = list(rot.shape) == list(expected_shape)
+
+        status_ref = "✅" if ok_ref else "❌"
+        status_rot = "✅" if ok_rot else "❌"
+
+        print(f"\n  样本 {i} (原始点数={N_i}):")
+        print(f"    {status_ref} reflect: {list(ref.shape)}  期望: {list(expected_shape)}")
+        print(f"    {status_rot} rotate:  {list(rot.shape)}  期望: {list(expected_shape)}")
+
+        if not ok_ref or not ok_rot:
+            all_ok = False
+
+    print("\n" + "=" * 60)
+    print("🏁 全部通过" if all_ok else "❌ 存在形状不匹配")
+    print("=" * 60)
+
+
+

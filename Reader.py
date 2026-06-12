@@ -122,7 +122,8 @@ class CombinedDataLoader:
             num_workers: int = 0,
             shuffle: bool = True,
             pin_memory: bool = True,
-            device: str = 'cpu'
+            device: str = 'cpu',
+            reader: str = 'tensor'
     ):
         """
         Args:
@@ -137,20 +138,35 @@ class CombinedDataLoader:
             intermediate_data_dir=intermediate_data_dir,
             device=device
         )
-
-        self.dataloader = DataLoader(
-            self.dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            pin_memory=pin_memory and device == 'cuda'
-        )
+        if reader == 'list':
+            self.dataloader = DataLoader(
+                self.dataset,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                num_workers=num_workers,
+                pin_memory=pin_memory and device == 'cuda',
+                collate_fn=self.collate_points_
+            )
+        elif reader == 'tensor':
+            self.dataloader = DataLoader(
+                self.dataset,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                num_workers=num_workers,
+                pin_memory=pin_memory and device == 'cuda'
+            )
 
     def __iter__(self):
         return iter(self.dataloader)
 
     def __len__(self):
         return len(self.dataloader)
+
+    @staticmethod
+    def collate_points_(batch):
+        voxels = torch.stack([item[0] for item in batch])  # (B, 1, 32, 32, 32)
+        points_list = [item[1] for item in batch]  # 保持为 list，不 stack
+        return voxels, points_list
 
 
 
@@ -202,7 +218,7 @@ if __name__ == '__main__':
     for batch_idx, (batch_voxels, batch_points) in enumerate(dataloader):
         print(f'\n  批次 {batch_idx}:')
         print(f'    体素批次: {batch_voxels.shape}')  # (32, 1, 32, 32, 32)
-        print(f'    点云批次: {batch_points.shape}')  # (32, num_samples, 3)
+        print(f'    点云数量: {len(batch_points)}')  # (32, num_samples, 3)
 
         if batch_idx == 2:  # 仅显示前 3 个批次
             break
@@ -224,14 +240,16 @@ if __name__ == '__main__':
         train_dataset,
         batch_size=32,
         shuffle=True,
-        num_workers=0
+        num_workers=0,
+        collate_fn=CombinedDataLoader.collate_points_
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=32,
         shuffle=False,
-        num_workers=0
+        num_workers=0,
+        collate_fn=CombinedDataLoader.collate_points_
     )
 
     print(f'\n训练集大小: {len(train_dataset)}')
@@ -243,7 +261,7 @@ if __name__ == '__main__':
     print("4. 数据检查")
     print("=" * 80)
 
-    batch_voxels, batch_points, batch_categories = next(iter(train_loader))
+    batch_voxels, batch_points = next(iter(train_loader))
 
     print(f'\n批次统计:')
     print(f'  体素形状: {batch_voxels.shape}')
@@ -251,14 +269,15 @@ if __name__ == '__main__':
     print(f'  体素值范围: [{batch_voxels.min():.2f}, {batch_voxels.max():.2f}]')
     print(f'  体素非零: {(batch_voxels > 0).sum().item()} / {batch_voxels.numel()}')
 
-    print(f'\n  点云形状: {batch_points.shape}')
-    print(f'  点云数据类型: {batch_points.dtype}')
-    print(f'  点云坐标范围:')
-    print(f'    X: [{batch_points[:, :, 0].min():.4f}, {batch_points[:, :, 0].max():.4f}]')
-    print(f'    Y: [{batch_points[:, :, 1].min():.4f}, {batch_points[:, :, 1].max():.4f}]')
-    print(f'    Z: [{batch_points[:, :, 2].min():.4f}, {batch_points[:, :, 2].max():.4f}]')
+    print(f'\n  点云类型: list of tensors（变长）')
+    print(f'  批次样本数: {len(batch_points)}')
+    print(f'  各样本点数: {[p.shape[0] for p in batch_points]}')
 
-    print(f'\n  类别: {batch_categories}')
+    all_points = torch.cat(batch_points, dim=0)
+    print(f'  点云坐标范围（跨所有样本）:')
+    print(f'    X: [{all_points[:, 0].min():.4f}, {all_points[:, 0].max():.4f}]')
+    print(f'    Y: [{all_points[:, 1].min():.4f}, {all_points[:, 1].max():.4f}]')
+    print(f'    Z: [{all_points[:, 2].min():.4f}, {all_points[:, 2].max():.4f}]')
 
     # 5. GPU 支持
     print("\n" + "=" * 80)

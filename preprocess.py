@@ -142,8 +142,12 @@ class UnifiedShapeNetProcessor:
 
                 # 采样点云
                 # ========== 【关键】使用 JSON 里的模型真实顶点数 ==========
-                num_vertices = shape_info['numVertices']  # 从json读取官方顶点数量
-                points = mesh.vertices.astype(np.float32)  # 直接用模型顶点，不随机采样
+                if num_samples <= 0:
+                    num_vertices = shape_info['numVertices']  # 从json读取官方顶点数量
+                    points = mesh.vertices.astype(np.float32)  # 直接用模型顶点，不随机采样
+                else:
+                    points, _ = trimesh.sample.sample_surface(mesh, num_samples)
+                    points = points.astype(np.float32)
 
                 # 保存
                 point_filename = f'points_{idx:06d}_{category_id}_{model_id}.npy'

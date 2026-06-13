@@ -38,6 +38,15 @@ class PRSNet(nn.Module):
         planes = self.plane_predictor(x)
         axes = self.axe_predictor(x)
 
+        # plane: 只归一化法向量 (nx,ny,nz)，d 自由
+        raw_norm = torch.norm(planes[..., :3], dim=-1, keepdim=True).clamp(min=1e-8)  # (B, 3, 1)
+        n = planes[..., :3] / raw_norm
+        d = planes[..., 3:4] / raw_norm
+        planes = torch.cat([n, d], dim=-1)
+
+        # quaternion: 整组归一化到单位四元数
+        axes = F.normalize(axes, dim=-1)  # (B, 3, 4)  单位四元数
+
         return planes, axes
 
 class Predictor(nn.Module):
@@ -60,17 +69,14 @@ class Predictor(nn.Module):
 
         y1 = F.leaky_relu(self.fc1_1(conv_result))
         y1 = F.leaky_relu(self.fc1_2(y1))
-        y1 = F.leaky_relu(self.fc1_3(y1))
-        y1 = F.normalize(y1)
+        y1 = self.fc1_3(y1)
 
         y2 = F.leaky_relu(self.fc2_1(conv_result))
         y2 = F.leaky_relu(self.fc2_2(y2))
-        y2 = F.leaky_relu(self.fc2_3(y2))
-        y2 = F.normalize(y2)
+        y2 = self.fc2_3(y2)
 
         y3 = F.leaky_relu(self.fc3_1(conv_result))
         y3 = F.leaky_relu(self.fc3_2(y3))
-        y3 = F.leaky_relu(self.fc3_3(y3))
-        y3 = F.normalize(y3)
+        y3 = self.fc3_3(y3)
 
-        return torch.stack((y1, y2, y3), 1)
+        return torch.stack((y1, y2, y3), dim=1)

@@ -2,7 +2,7 @@ import torch
 from numpy.f2py.auxfuncs import throw_error
 from torch import nn
 import numpy as np
-import quaternion
+from torch.nn import functional as F
 
 
 class SymmetryLoss(nn.Module):
@@ -12,7 +12,7 @@ class SymmetryLoss(nn.Module):
     # plane (B,3,4) quaternion(B,3,4) points(N,3)*B
     def forward(self, plane, quaternion, points_batch, nearest_idx_maps, nearest_pts_maps, max_min):
         n, d = self.convertToDirection(plane)
-        if isinstance(points_batch, list):  # 全部读取
+        if isinstance(points_batch, list):  # 全部读取(debug)
             reflect_points = list()
             rotated_points = list()
             if len(points_batch) != plane.shape[0] or len(points_batch) != quaternion.shape[0]:
@@ -27,9 +27,9 @@ class SymmetryLoss(nn.Module):
         elif isinstance(points_batch, torch.Tensor):  # 定长采样
             reflect_p = self.genReflectPoints(n, d, points_batch)
             rotation_p = self.genRotationPoints(quaternion, points_batch)
-            all_transformed_points = torch.cat([reflect_p, rotation_p], dim=-2)
-            D = self.calc_distances(all_transformed_points, nearest_idx_maps, nearest_pts_maps, max_min)
-            return D
+            Dref = self.chamfer_distance(reflect_p, points_batch)
+            Drot = self.chamfer_distance(rotation_p, points_batch)
+            return Dref + Drot
 
     def convertToDirection(self, plane):
         return plane[..., 0:3], plane[..., 3]
@@ -46,50 +46,119 @@ class SymmetryLoss(nn.Module):
         reflectPoints = points.unsqueeze(-2) - scale.unsqueeze(-1) * n.unsqueeze(1)
         return reflectPoints
 
+    def rotate_vector_by_quaternion(self, quat, vec):
+        # quat: [*,4] (w,x,y,z), vec:[*,3]
+        q_w, q_x, q_y, q_z = torch.unbind(quat, dim=-1)
+        v_x, v_y, v_z = torch.unbind(vec, dim=-1)
+        # 四元数旋转展开公式
+        out_x = (1 - 2 * q_y ** 2 - 2 * q_z ** 2) * v_x + 2 * (q_x * q_y - q_w * q_z) * v_y + 2 * (
+                q_x * q_z + q_w * q_y) * v_z
+        out_y = 2 * (q_x * q_y + q_w * q_z) * v_x + (1 - 2 * q_x ** 2 - 2 * q_z ** 2) * v_y + 2 * (
+                q_y * q_z - q_w * q_x) * v_z
+        out_z = 2 * (q_x * q_z - q_w * q_y) * v_x + 2 * (q_y * q_z + q_w * q_x) * v_y + (
+                1 - 2 * q_x ** 2 - 2 * q_y ** 2) * v_z
+        return torch.stack([out_x, out_y, out_z], dim=-1)
+
     # quaternion B*3*4
     def genRotationPoints(self, Bquaternion, points):
-        Lquaternions = torch.unbind(Bquaternion, dim=1)
-        rotated_list = []
-        for quat in Lquaternions:
-            p = quaternion.as_quat_array(quat.detach().numpy())
-            p = p[:, np.newaxis]
-            q = quaternion.from_vector_part(points)
-            q_ = p * q * p.conjugate()
-            rotated_list.append(torch.tensor(quaternion.as_vector_part(q_)))
-
-        rotated_points = torch.stack(rotated_list, dim=-2)
-        return rotated_points
+        B, J, _ = Bquaternion.shape
+        N, _ = points.shape[-2:]
+        quats = Bquaternion.unsqueeze(1)  # [B,1,J,4]
+        vecs = points.unsqueeze(-2)  # [B,N,1,3]
+        rotated = self.rotate_vector_by_quaternion(quats, vecs)  # [B,N,J,3]
+        return rotated
 
     def calc_distances(self, transformed_points, idx_maps, nearest_points_maps, max_min):
+        # 体素化处理
         bbox_max, bbox_min = max_min
-        bbox_max = bbox_max[:, None, None, :]
+        bbox_max = bbox_max[:, None, None, :]  # (B, 1, 1, 3)
         bbox_min = bbox_min[:, None, None, :]
         size = bbox_max - bbox_min
         V = 32
         norm = (transformed_points - bbox_min) / size * V
-        voxel_ijk = torch.floor(norm).clamp(0, V - 1).long()  # (B, N, M, 3) int64
+        voxel_ijk = torch.floor(norm).clamp(0, V - 1).long()  # (B, N, M, 3)
 
-        points_axe_list = torch.unbind(transformed_points, dim=-2)
-        voxel_ijk_axe_list = torch.unbind(voxel_ijk, dim=-2)
+        # 最近点获取
+        B, N, M, _ = voxel_ijk.shape
+        b_idx = torch.arange(B, device=voxel_ijk.device)[:, None, None]  # (B, 1, 1)
+        i = voxel_ijk[..., 0].long()  # (B, N, M)
+        j = voxel_ijk[..., 1].long()
+        k = voxel_ijk[..., 2].long()
 
-        distance_sum = 0
-        for points, ijk in zip(points_axe_list, voxel_ijk_axe_list):
-            B, N, _ = ijk.shape
-            nearest_points = torch.zeros(B, N, 3, device=nearest_points_maps.device, dtype=nearest_points_maps.dtype)
+        # 一次性取出所有最近点 (B, N, M, 3)
+        nearest_points = nearest_points_maps[b_idx, i, j, k]
 
-            for b in range(B):
-                i = ijk[b, :, 0].long()
-                j = ijk[b, :, 1].long()
-                k = ijk[b, :, 2].long()
-                nearest_points[b] = nearest_points_maps[b, i, j, k]  # (N, 3)
-            # nearest_points 是每个变换后的点对应体素的物体真实表面的最近点
-            distances = points - nearest_points
-            distances = torch.sum(distances * distances, dim=-1).sqrt()
-            min_distance = distances.min(dim=-1).values
-            distance_sum += torch.sum(min_distance, dim=0)
+        # 距离 (B, N, M)
+        distances = ((transformed_points - nearest_points) ** 2).sum(dim=-1).sqrt()
 
-        return distance_sum
+        avg_distance = distances.sum(dim=1)  # (B, M)  对所有点求和
+        loss = avg_distance.sum()  # scalar  所有generator累加
 
+        return loss / B
+
+    def chamfer_distance(self, transformed, original):
+        """
+        transformed: (B, N, M, 3)  变换后的点
+        original:   (B, N, 3)      原始点云
+        返回双向 Chamfer distance 的均值
+        """
+        B, N, M, _ = transformed.shape
+
+        total_loss = 0.0
+        for m in range(M):
+            t = transformed[:, :, m, :]  # (B, N, 3)
+
+            # Forward:  变换点 → 原始点 的最近距离
+            d_fwd = torch.cdist(t, original)  # (B, N, N)
+            loss_fwd = d_fwd.min(dim=-1)[0].mean()  # 对每个变换点取最近，再平均
+
+            # Backward: 原始点 → 变换点 的最近距离
+            d_bwd = torch.cdist(original, t)  # (B, N, N)
+            loss_bwd = d_bwd.min(dim=-1)[0].mean()
+
+            total_loss += (loss_fwd + loss_bwd)
+
+        return total_loss / M  # 归一化到每个操作
+
+
+class RegularLoss(nn.Module):
+    def __init__(self):
+        super(RegularLoss, self).__init__()
+
+    def forward(self, plane, quat):
+        dirs = plane[..., 0:3]
+        M1 = self.convertDirToMatrix(dirs)
+        M2 = self.convertDirToMatrix(quat)
+        I1 = torch.eye(3, device=M1.device, dtype=M1.dtype)
+        I2 = torch.eye(3, device=M1.device, dtype=M1.dtype)
+        A = M1 @ M1.transpose(-1, -2) - I1
+        B = M2 @ M2.transpose(-1, -2) - I2
+        Dr = A**2 + B**2
+        Dr = Dr.sum()
+        return Dr
+
+    def convertDirToMatrix(self, dirs):
+        norm_dirs = F.normalize(dirs, dim=-1)
+        return norm_dirs
+
+    def covertQuatToNa(self, quat):
+        axes = quat[..., 1:]  # (B, 3, 3)
+        axes = F.normalize(axes, dim=-1)  # 单位化
+        M_flat = axes.reshape_as(axes)  # (B, 9)
+        return M_flat
+
+
+class PRSLoss(nn.Module):
+    def __init__(self):
+        super(PRSLoss, self).__init__()
+        self.Symmetry = SymmetryLoss()
+        self.Regular = RegularLoss()
+        self.gamma = 0.8
+
+    def forward(self, planes, quaternions, points_batch, nearest_idx_maps, nearest_pts_maps, max_min):
+        Ds = self.Symmetry(planes, quaternions, points_batch, nearest_idx_maps, nearest_pts_maps, max_min)
+        Dr = self.Regular(planes, quaternions)
+        return Ds + self.gamma * Dr
     # ===================== 测试 =====================
 
 

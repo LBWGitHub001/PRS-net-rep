@@ -49,6 +49,10 @@ class CombinedDataset(Dataset):
 
         print(f'✅ 加载了 {len(self.files)} 个模型对')
 
+        # ── 统一移到设备 ──
+        self.voxel_tensors = self.voxel_tensors.to(self.device)
+        self.point_tensors = [p.to(self.device) for p in self.point_tensors]
+
     def _preload_data(self):
         """预加载所有体素和点云数据"""
         print("🔄 预加载数据...")
@@ -88,23 +92,23 @@ class CombinedDataset(Dataset):
                         meta = json.load(mf)
                     bbox_min = np.array(meta['min'], dtype=np.float32)
                     bbox_max = np.array(meta['max'], dtype=np.float32)
-                    self.bbox_mins.append(bbox_min)
-                    self.bbox_maxs.append(bbox_max)
                 else:
                     # 回退：用点云范围估算
                     bbox_min = points_data.min(axis=0)
                     bbox_max = points_data.max(axis=0)
-                    self.bbox_mins.append(bbox_min.astype(np.float32))
-                    self.bbox_maxs.append(bbox_max.astype(np.float32))
 
                 # ---- 预计算：体素→最近点 ----
                 near_idx, near_pts = self._compute_voxel_nearest(
                     voxel_data, points_data, bbox_min, bbox_max
                 )
-                near_idx_t = torch.from_numpy(near_idx)  # (32,32,32) int32
-                near_pts_t = torch.from_numpy(near_pts)  # (32,32,32,3) float32
+                near_idx_t = torch.from_numpy(near_idx).to(self.device)  # (32,32,32) int32
+                near_pts_t = torch.from_numpy(near_pts).to(self.device)  # (32,32,32,3) float32
                 self.nearest_idx_maps.append(near_idx_t)
                 self.nearest_pts_maps.append(near_pts_t)
+                bbox_min = torch.from_numpy(bbox_min).to(self.device)
+                bbox_max = torch.from_numpy(bbox_max).to(self.device)
+                self.bbox_mins.append(bbox_min)
+                self.bbox_maxs.append(bbox_max)
 
 
             except Exception as e:

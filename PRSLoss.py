@@ -36,13 +36,8 @@ class SymmetryLoss(nn.Module):
 
     def genReflectPoints(self, n, d, points):
         dot = (points.unsqueeze(-2) * n.unsqueeze(1)).sum(dim=-1) + d.unsqueeze(-2)
-
         norm_sq = torch.sum(n * n, dim=-1).unsqueeze(-2)  # (*)
-
-        # P' = P - 2 * dot / ‖n‖² * n
-        scale = 2 * dot / norm_sq.clamp(min=1e-8)  # 广播
-
-        # 扩展 scale 和 n 维度与 points 对齐
+        scale = 2 * dot / norm_sq.clamp(min=1e-8)
         reflectPoints = points.unsqueeze(-2) - scale.unsqueeze(-1) * n.unsqueeze(1)
         return reflectPoints
 

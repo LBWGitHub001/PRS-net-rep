@@ -160,7 +160,7 @@ if __name__ == "__main__":
     print(f"    设备: {device_name}\n")
 
     # ==================== 优化器 + 调度器 ====================
-    optimizer = optim.AdamW(model.parameters(), lr=0.0005, betas=(0.9, 0.999))
+    optimizer = optim.AdamW(model.parameters(), lr=0.001, betas=(0.9, 0.999))
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=10, T_mult=2, eta_min=1e-6
     )

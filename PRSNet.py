@@ -63,6 +63,31 @@ class Predictor(nn.Module):
         self.fc3_1 = nn.Linear(64, 32)
         self.fc3_2 = nn.Linear(32, 16)
         self.fc3_3 = nn.Linear(16, 4)
+        self._init_weights()
+
+    def _init_weights(self):
+        preset_bias = {
+            # 反射平面初始在 x=0, y=0, z=0（法向量 + d=0 平面过原点）
+            'fc1_3': torch.tensor([1.0, 0.0, 0.0, 0.0]),  # x=0
+            'fc2_3': torch.tensor([0.0, 1.0, 0.0, 0.0]),  # y=0
+            'fc3_3': torch.tensor([0.0, 0.0, 1.0, 0.0]),  # z=0
+            # 旋转轴初始在 X / Y / Z（四元数 w=cos(θ/2)）
+            'fc4_3': torch.tensor([0.7071, 1.0, 0.0, 0.0]),  # 绕 X 轴 ~90°
+            'fc5_3': torch.tensor([0.7071, 0.0, 1.0, 0.0]),  # 绕 Y 轴 ~90°
+            'fc6_3': torch.tensor([0.7071, 0.0, 0.0, 1.0]),  # 绕 Z 轴 ~90°
+        }
+
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                if name in preset_bias:
+                    # ── 最后一层：weight=0, bias=预设 ──
+                    nn.init.zeros_(module.weight)
+                    module.bias.data.copy_(preset_bias[name])
+                else:
+                    # ── 普通层：N(0, 0.02) ──
+                    nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
 
     def forward(self, x):
         conv_result = x.view(x.size(0), -1)

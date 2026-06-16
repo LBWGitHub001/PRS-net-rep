@@ -54,115 +54,73 @@ class CombinedDataset(Dataset):
         self.point_tensors = [p.to(self.device) for p in self.point_tensors]
 
     def _preload_data(self):
-        """预加载所有体素和点云数据"""
+        """预加载所有体素、点云和预处理好的 nearest maps"""
         print("🔄 预加载数据...")
 
         self.voxel_tensors = []
         self.point_tensors = []
         self.bbox_mins = []
         self.bbox_maxs = []
+        self.nearest_idx_maps = []
+        self.nearest_pts_maps = []
 
         voxel_dir = self.data_dir / 'voxels'
         point_dir = self.data_dir / 'point_clouds'
+        map_dir = self.data_dir / 'maps'
+        meta_dir = self.data_dir / 'metadata'
 
         for file_info in self.files:
             try:
                 # 加载体素
                 voxel_path = voxel_dir / file_info['voxel_file']
                 voxel_data = np.load(voxel_path)
-                voxel_tensor = torch.from_numpy(voxel_data).float()
-                voxel_tensor = voxel_tensor.unsqueeze(0)  # (1, 32, 32, 32)
-                bboox_min, bboox_max = 0, 0
+                voxel_tensor = torch.from_numpy(voxel_data).float().unsqueeze(0)
 
-                # 加载点云
+                # 加载下采样点云（1000点，给 loss 做反射/旋转）
                 point_path = point_dir / file_info['point_file']
                 points_data = np.load(point_path)
                 points_tensor = torch.from_numpy(points_data).float()
 
-                # 应用变换
                 if self.transform:
                     voxel_tensor = self.transform(voxel_tensor)
 
                 self.voxel_tensors.append(voxel_tensor)
                 self.point_tensors.append(points_tensor)
 
-                meta_path = self.data_dir / 'metadata' / file_info.get('metadata_file', '')
+                # ── 从 metadata 读取 bbox 和 nearest map 文件名 ──
+                meta_path = meta_dir / file_info.get('metadata_file', '')
                 if meta_path.exists():
                     with open(meta_path, 'r') as mf:
                         meta = json.load(mf)
                     bbox_min = np.array(meta['min'], dtype=np.float32)
                     bbox_max = np.array(meta['max'], dtype=np.float32)
+
+                    # 🔧 直接加载预处理好的 nearest maps
+                    near_idx = np.load(map_dir / meta['near_idx_file'])  # (32,32,32) int32
+                    near_pts = np.load(map_dir / meta['near_pts_file'])  # (32,32,32,3) float32
                 else:
-                    # 回退：用点云范围估算
-                    bbox_min = points_data.min(axis=0)
-                    bbox_max = points_data.max(axis=0)
+                    # 回退（不应发生）
+                    bbox_min = points_data.min(axis=0).astype(np.float32)
+                    bbox_max = points_data.max(axis=0).astype(np.float32)
+                    near_idx = np.full((32, 32, 32), -1, dtype=np.int32)
+                    near_pts = np.zeros((32, 32, 32, 3), dtype=np.float32)
 
-                # ---- 预计算：体素→最近点 ----
-                near_idx, near_pts = self._compute_voxel_nearest(
-                    voxel_data, points_data, bbox_min, bbox_max
-                )
-                near_idx_t = torch.from_numpy(near_idx).to(self.device)  # (32,32,32) int32
-                near_pts_t = torch.from_numpy(near_pts).to(self.device)  # (32,32,32,3) float32
-                self.nearest_idx_maps.append(near_idx_t)
-                self.nearest_pts_maps.append(near_pts_t)
-                bbox_min = torch.from_numpy(bbox_min).to(self.device)
-                bbox_max = torch.from_numpy(bbox_max).to(self.device)
-                self.bbox_mins.append(bbox_min)
-                self.bbox_maxs.append(bbox_max)
-
+                self.bbox_mins.append(torch.from_numpy(bbox_min).to(self.device))
+                self.bbox_maxs.append(torch.from_numpy(bbox_max).to(self.device))
+                self.nearest_idx_maps.append(torch.from_numpy(near_idx).to(self.device))
+                self.nearest_pts_maps.append(torch.from_numpy(near_pts).to(self.device))
 
             except Exception as e:
-                print(f"⚠️  跳过文件 {file_info['voxel_file']}: {str(e)}")
+                print(f"⚠️  跳过文件 {file_info.get('voxel_file', '?')}: {str(e)}")
                 continue
 
-        # 栈合并
-        self.voxel_tensors = torch.stack(self.voxel_tensors)  # (N, 1, 32, 32, 32)
-
-        # 移到设备
-        self.voxel_tensors = self.voxel_tensors.to(self.device)
+        # 栈合并体素
+        self.voxel_tensors = torch.stack(self.voxel_tensors)
 
         print(f"✅ 预加载完成！")
         print(f"   体素张量形状: {self.voxel_tensors.shape}")
+        print(f"   样本数: {len(self.point_tensors)}")
         print(f"   内存占用: {self.voxel_tensors.element_size() * self.voxel_tensors.nelement() / 1024 ** 2:.2f} MB")
-
-    @staticmethod
-    def _compute_voxel_nearest(voxel_np, pts_np, bbox_min, bbox_max):
-        """
-        voxel_np : (32, 32, 32) uint8
-        pts_np   : (N, 3) float32
-        bbox_min : (3,) float32  — metadata 精确包围盒
-        bbox_max : (3,) float32
-        返回:
-          nearest_idx : (32, 32, 32) int32  空体素=-1
-          nearest_pts : (32, 32, 32, 3) float32  空体素=0
-        """
-        V = 32
-        size = bbox_max - bbox_min  # (3,)
-
-        # 体素中心坐标（包围盒空间）
-        coords = (np.arange(V) + 0.5) / V  # (32,)
-        ii, jj, kk = np.meshgrid(coords, coords, coords, indexing='ij')
-        cx = bbox_min[0] + ii * size[0]
-        cy = bbox_min[1] + jj * size[1]
-        cz = bbox_min[2] + kk * size[2]
-        centers = np.stack([cx, cy, cz], axis=-1).reshape(-1, 3)  # (32768, 3)
-
-        # 空体素掩码
-        empty_mask = (voxel_np == 0).reshape(-1)
-
-        # KDTree 查询（只查非空体素以加速）
-        tree = KDTree(pts_np)
-        dist, idx = tree.query(centers, workers=1)
-
-        # 重塑
-        idx_3d = idx.astype(np.int32).reshape(V, V, V)
-        idx_3d[empty_mask.reshape(V, V, V)] = -1
-
-        # 最近点坐标 (32,32,32,3)，空体素填 nan
-        pts_3d = pts_np[idx].reshape(V, V, V, 3).astype(np.float32)
-        pts_3d[empty_mask.reshape(V, V, V)] = 0.0 #TODO 到0.0的位置值应该比较大，这里可能是一个隐患
-
-        return idx_3d, pts_3d
 
     def __len__(self) -> int:
         """返回数据集大小"""

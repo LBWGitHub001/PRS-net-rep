@@ -8,13 +8,13 @@ from PRSLoss import *
 import PRSNet
 
 # ==================== 配置 ====================
-num_epochs = 100
-batch_size = 32
+num_epochs = 200
+batch_size = 16
 device_name = "cuda" if torch.cuda.is_available() else "cpu"
 val_split = 0.15  # 15% 验证集
 best_model_path = './prs-net-best.pth'
 last_model_path = './prs-net-last.pth'
-patience = 15  # 早停：验证 loss 不降超过 15 轮就停
+patience = 1500  # 早停：验证 loss 不降超过 15 轮就停
 
 
 def evaluate(model, dataloader, loss_func):
@@ -77,12 +77,6 @@ def train(num_epochs, train_loader, val_loader, model, optimizer, scheduler,
         print(f"┌─ Epoch {epoch:3d} | train: {avg_train_loss:.6f} | val: {avg_val_loss:.6f}{flag}")
         print(f"└─ lr: {optimizer.param_groups[0]['lr']:.2e}")
 
-        # ==================== 参数直方图（每 10 epoch）====================
-        if epoch % 10 == 0:
-            for name, param in model.named_parameters():
-                writer.add_histogram(f'Parameters/{name}', param.data, epoch)
-                if param.grad is not None:
-                    writer.add_histogram(f'Gradients/{name}', param.grad, epoch)
 
         # ==================== 保存最优模型 ====================
         if is_best:

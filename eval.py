@@ -217,8 +217,9 @@ if __name__ == "__main__":
 
     # 推理
     results = evaluate(model, dataset, loss_func,
-                       device=DEVICE, num_samples=5)
+                       device=DEVICE, num_samples=10)
 
     # 可视化第一个
     for m in range(5):
         visualize_symmetry(results[m])
+        print(results[m]["planes"])

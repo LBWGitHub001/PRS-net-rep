@@ -7,6 +7,7 @@ from tqdm import tqdm
 import json
 from typing import Tuple
 import trimesh
+from scipy.spatial import KDTree
 
 
 class UnifiedShapeNetProcessor:
@@ -27,10 +28,12 @@ class UnifiedShapeNetProcessor:
         # 创建子文件夹
         self.voxel_dir = self.output_dir / 'voxels'
         self.point_dir = self.output_dir / 'point_clouds'
+        self.map_dir = self.output_dir / 'maps'
         self.metadata_dir = self.output_dir / 'metadata'
 
         self.voxel_dir.mkdir(parents=True, exist_ok=True)
         self.point_dir.mkdir(parents=True, exist_ok=True)
+        self.map_dir.mkdir(parents=True, exist_ok=True)
         self.metadata_dir.mkdir(parents=True, exist_ok=True)
 
         self.num_workers = num_workers or os.cpu_count()
@@ -107,9 +110,47 @@ class UnifiedShapeNetProcessor:
         return points.astype(np.float32)
 
     @staticmethod
+    def _compute_voxel_nearest(voxel_np, pts_np, bbox_min, bbox_max, V=32):
+        """
+        voxel_np : (32, 32, 32) uint8
+        pts_np   : (N, 3) float32
+        bbox_min : (3,) float32  — metadata 精确包围盒
+        bbox_max : (3,) float32
+        返回:
+          nearest_idx : (32, 32, 32) int32  空体素=-1
+          nearest_pts : (32, 32, 32, 3) float32  空体素=0
+        """
+        size = bbox_max - bbox_min  # (3,)
+
+        # 体素中心坐标（包围盒空间）
+        coords = (np.arange(V) + 0.5) / V  # (32,)
+        ii, jj, kk = np.meshgrid(coords, coords, coords, indexing='ij')
+        cx = bbox_min[0] + ii * size[0]
+        cy = bbox_min[1] + jj * size[1]
+        cz = bbox_min[2] + kk * size[2]
+        centers = np.stack([cx, cy, cz], axis=-1).reshape(-1, 3)  # (32768, 3)
+
+        # 空体素掩码
+        empty_mask = (voxel_np == 0).reshape(-1)
+
+        # KDTree 查询（只查非空体素以加速）
+        tree = KDTree(pts_np)
+        dist, idx = tree.query(centers, workers=1)
+
+        # 重塑
+        idx_3d = idx.astype(np.int32).reshape(V, V, V)
+        idx_3d[empty_mask.reshape(V, V, V)] = -1
+
+        # 最近点坐标 (32,32,32,3)，空体素填 nan
+        pts_3d = pts_np[idx].reshape(V, V, V, 3).astype(np.float32)
+        # pts_3d[empty_mask.reshape(V, V, V)] = -1.0 #TODO 到0.0的位置值应该比较大，这里可能是一个隐患
+
+        return idx_3d, pts_3d
+
+    @staticmethod
     def process_single_model(args: Tuple) -> dict:
         idx, category_id, model_id, obj_path, binvox_path, json_path, \
-            voxel_dir, point_dir, metadata_dir, num_samples = args
+            voxel_dir, point_dir, map_dir, metadata_dir, num_samples = args
 
         result = {
             'index': idx,
@@ -132,16 +173,20 @@ class UnifiedShapeNetProcessor:
 
             # ========== 处理点云：使用官方质心居中 ==========
             point_file = None
+            full_point_file = None
+            full_voxel_file = None
+            near_idx_filename = None
+            near_pts_filename = None
+            full_points = None
             try:
                 mesh = trimesh.load(obj_path)
                 if isinstance(mesh, trimesh.Scene):
                     mesh = trimesh.util.concatenate([geom for geom in mesh.geometry.values()])
 
-                # ✅ 使用 json 里的真实 centroid 居中
-                mesh.vertices -= centroid_gt
-
                 # 采样点云
                 # ========== 【关键】使用 JSON 里的模型真实顶点数 ==========
+                num_vertices = shape_info['numVertices']  # 从json读取官方顶点数量
+                full_points = mesh.vertices.astype(np.float32)  # 直接用模型顶点，不随机采样
                 if num_samples <= 0:
                     num_vertices = shape_info['numVertices']  # 从json读取官方顶点数量
                     points = mesh.vertices.astype(np.float32)  # 直接用模型顶点，不随机采样
@@ -149,30 +194,74 @@ class UnifiedShapeNetProcessor:
                     points, _ = trimesh.sample.sample_surface(mesh, num_samples)
                     points = points.astype(np.float32)
 
+                # 下采样结果
+                pc_centroid = points.mean(axis=0)
+                points = points - pc_centroid
+                min_gt = min_gt - pc_centroid
+                max_gt = max_gt - pc_centroid
+                centroid_gt = centroid_gt - pc_centroid
+
+                # 真实点云
+                full_points = full_points - pc_centroid
+
                 # 保存
+                ## 下采样
                 point_filename = f'points_{idx:06d}_{category_id}_{model_id}.npy'
                 point_path = os.path.join(point_dir, point_filename)
                 np.save(point_path, points)
                 point_file = point_filename
                 result['point_file'] = point_filename
                 result['point_count'] = int(len(points))
+
+                ## 原始点云
+                full_point_filename = f'full_points_{idx:06d}_{category_id}_{model_id}.npy'
+                full_point_path = os.path.join(point_dir, full_point_filename)
+                np.save(full_point_path, full_points)
+                full_point_file = full_point_filename
+                result['full_point_file'] = full_point_filename
+                result['full_point_count'] = int(len(full_points))
+
+
             except Exception as e:
                 result['errors'].append(f'点云失败: {str(e)}')
 
             # ========== 处理体素：同样居中 ==========
             voxel_file = None
-            try:
-                voxels = UnifiedShapeNetProcessor._read_binvox(binvox_path)
-                voxels = UnifiedShapeNetProcessor._resize_voxel_32(voxels)
-                voxel_occupancy = (voxels > 0).mean() * 100
 
+            try:
+                full_voxels = UnifiedShapeNetProcessor._read_binvox(binvox_path)
+                sampled_voxels = UnifiedShapeNetProcessor._resize_voxel_32(full_voxels)
+                voxel_occupancy = (sampled_voxels > 0).mean() * 100
+                # 保存完全体点云
+                full_voxel_filename = f'full_voxel_{idx:06d}_{category_id}_{model_id}.npy'
+                full_voxel_path = os.path.join(voxel_dir, full_voxel_filename)
+                np.save(full_voxel_path, sampled_voxels)
+                full_voxel_file = full_voxel_filename
+                result['full_voxel_file'] = full_voxel_filename
+
+                # 保存下采样点云
                 if voxel_occupancy > 0.1:
                     voxel_filename = f'voxel_{idx:06d}_{category_id}_{model_id}.npy'
                     voxel_path = os.path.join(voxel_dir, voxel_filename)
-                    np.save(voxel_path, voxels)
+                    np.save(voxel_path, sampled_voxels)
                     voxel_file = voxel_filename
                     result['voxel_file'] = voxel_filename
                     result['voxel_occupancy'] = float(voxel_occupancy)
+
+                    # ========== 计算最临近映射 ==========
+                    bbox_min = min_gt
+                    bbox_max = max_gt
+                    near_idx, near_pts = UnifiedShapeNetProcessor._compute_voxel_nearest(
+                        sampled_voxels, full_points, bbox_min, bbox_max, V=32
+                    )
+
+                    near_idx_filename = f'near_idx_{idx:06d}_{category_id}_{model_id}.npy'
+                    near_pts_filename = f'near_pts_{idx:06d}_{category_id}_{model_id}.npy'
+                    np.save(os.path.join(map_dir, near_idx_filename), near_idx)
+                    np.save(os.path.join(map_dir, near_pts_filename), near_pts)
+
+                    result['near_idx_file'] = near_idx_filename
+                    result['near_pts_file'] = near_pts_filename
             except Exception as e:
                 result['errors'].append(f'体素失败: {str(e)}')
 
@@ -187,6 +276,10 @@ class UnifiedShapeNetProcessor:
                     'max': max_gt.tolist(),
                     'voxel_file': voxel_file,
                     'point_file': point_file,
+                    'full_point_file': full_point_file,
+                    'full_voxel_file': full_voxel_file,
+                    'near_idx_file': near_idx_filename,
+                    'near_pts_file': near_pts_filename
                 }
                 meta_fn = f'meta_{idx:06d}_{category_id}_{model_id}.json'
                 with open(os.path.join(metadata_dir, meta_fn), 'w') as f:
@@ -211,6 +304,7 @@ class UnifiedShapeNetProcessor:
         print(f'📂 输出目录: {self.output_dir}')
         print(f'   ├─ 体素: {self.voxel_dir}')
         print(f'   ├─ 点云: {self.point_dir}')
+        print(f'   ├─ 临近映射: {self.map_dir}')
         print(f'   └─ 元数据: {self.metadata_dir}')
         print(f'🎯 采样点数: {self.num_samples}')
         print('-' * 80)
@@ -218,7 +312,7 @@ class UnifiedShapeNetProcessor:
         # 准备任务
         tasks = [
             (idx, cat, mid, obj, binvox, json_path,
-             str(self.voxel_dir), str(self.point_dir), str(self.metadata_dir),
+             str(self.voxel_dir), str(self.point_dir), str(self.map_dir), str(self.metadata_dir),
              self.num_samples)
             for idx, (cat, mid, obj, binvox, json_path) in enumerate(models)
         ]
@@ -256,6 +350,10 @@ class UnifiedShapeNetProcessor:
                         'model_id': result['model_id'],
                         'voxel_file': result['voxel_file'],
                         'point_file': result['point_file'],
+                        'full_point_file': result.get('full_point_file'),
+                        'full_voxel_file': result.get('full_voxel_file'),
+                        'near_idx_file': result.get('near_idx_file'),
+                        'near_pts_file': result.get('near_pts_file'),
                         'metadata_file': result['metadata_file'],
                         'voxel_occupancy': result.get('voxel_occupancy'),
                         'point_count': result.get('point_count'),

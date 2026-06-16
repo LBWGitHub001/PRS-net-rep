@@ -1,4 +1,5 @@
 import torch
+from networkx.classes import is_empty
 from numpy.f2py.auxfuncs import throw_error
 from torch import nn
 import numpy as np
@@ -27,8 +28,10 @@ class SymmetryLoss(nn.Module):
         elif isinstance(points_batch, torch.Tensor):  # 定长采样
             reflect_p = self.genReflectPoints(n, d, points_batch)
             rotation_p = self.genRotationPoints(quaternion, points_batch)
-            Dref = self.chamfer_distance(reflect_p, points_batch)
-            Drot = self.chamfer_distance(rotation_p, points_batch)
+            # Dref = self.chamfer_distance(reflect_p, points_batch)
+            # Drot = self.chamfer_distance(rotation_p, points_batch)
+            Dref = self.calc_distances(reflect_p, nearest_idx_maps, nearest_pts_maps, max_min)
+            Drot = self.calc_distances(rotation_p, nearest_idx_maps, nearest_pts_maps, max_min)
             return Dref + Drot
 
     def convertToDirection(self, plane):
@@ -71,7 +74,7 @@ class SymmetryLoss(nn.Module):
         size = bbox_max - bbox_min
         V = 32
         norm = (transformed_points - bbox_min) / size * V
-        voxel_ijk = torch.floor(norm).clamp(0, V - 1).long()  # (B, N, M, 3)
+        voxel_ijk = torch.round(norm).clamp(0, V - 1).long()  # (B, N, M, 3)
 
         # 最近点获取
         B, N, M, _ = voxel_ijk.shape
@@ -83,20 +86,19 @@ class SymmetryLoss(nn.Module):
         # 一次性取出所有最近点 (B, N, M, 3)
         nearest_points = nearest_points_maps[b_idx, i, j, k]
 
-        # 距离 (B, N, M)
-        distances = ((transformed_points - nearest_points) ** 2).sum(dim=-1).sqrt()
 
-        avg_distance = distances.sum(dim=1)  # (B, M)  对所有点求和
-        loss = avg_distance.sum()  # scalar  所有generator累加
+        # occupied_mask = (idx_maps[b_idx, i, j, k] >= 0)  # (B, N, M)
 
-        return loss / B
+        # dDis = (transformed_points - nearest_points).pow(2).sum(dim=-1).sqrt()
+        # dDis = dDis.masked_fill(occupied_mask, 0.0)
+
+        # valid_count = (~occupied_mask).float().sum() + 1e-8
+        # loss = dDis.sum() / valid_count
+        dDis = (transformed_points - nearest_points).pow(2).sum(dim=-1).sqrt()
+        loss = dDis.mean()
+        return loss
 
     def chamfer_distance(self, transformed, original):
-        """
-        transformed: (B, N, M, 3)  变换后的点
-        original:   (B, N, 3)      原始点云
-        返回双向 Chamfer distance 的均值
-        """
         B, N, M, _ = transformed.shape
 
         total_loss = 0.0
@@ -113,7 +115,7 @@ class SymmetryLoss(nn.Module):
 
             total_loss += (loss_fwd + loss_bwd)
 
-        return total_loss / M  # 归一化到每个操作
+        return total_loss / B  # 归一化到每个操作
 
 
 class RegularLoss(nn.Module):
@@ -128,7 +130,7 @@ class RegularLoss(nn.Module):
         I2 = torch.eye(3, device=M1.device, dtype=M1.dtype)
         A = M1 @ M1.transpose(-1, -2) - I1
         B = M2 @ M2.transpose(-1, -2) - I2
-        Dr = A**2 + B**2
+        Dr = A ** 2 + B ** 2
         Dr = Dr.sum()
         return Dr
 
@@ -148,13 +150,15 @@ class PRSLoss(nn.Module):
         super(PRSLoss, self).__init__()
         self.Symmetry = SymmetryLoss()
         self.Regular = RegularLoss()
-        self.gamma = 0.8
+        self.gamma = 1.0
 
     def forward(self, planes, quaternions, points_batch, nearest_idx_maps, nearest_pts_maps, max_min):
         Ds = self.Symmetry(planes, quaternions, points_batch, nearest_idx_maps, nearest_pts_maps, max_min)
         Dr = self.Regular(planes, quaternions)
-        return Ds + self.gamma * Dr
-    # ===================== 测试 =====================
+        return Ds 
+
+
+# ===================== 测试 =====================
 
 
 import torch

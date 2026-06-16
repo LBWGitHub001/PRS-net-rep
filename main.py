@@ -8,8 +8,8 @@ from PRSLoss import *
 import PRSNet
 
 # ==================== 配置 ====================
-num_epochs = 200
-batch_size = 16
+num_epochs = 100
+batch_size = 32
 device_name = "cuda" if torch.cuda.is_available() else "cpu"
 val_split = 0.15  # 15% 验证集
 best_model_path = './prs-net-best.pth'
@@ -154,7 +154,7 @@ if __name__ == "__main__":
     print(f"    设备: {device_name}\n")
 
     # ==================== 优化器 + 调度器 ====================
-    optimizer = optim.AdamW(model.parameters(), lr=0.001, betas=(0.9, 0.999))
+    optimizer = optim.AdamW(model.parameters(), lr=0.005, betas=(0.9, 0.999))
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=10, T_mult=2, eta_min=1e-6
     )

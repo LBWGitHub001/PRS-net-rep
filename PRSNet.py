@@ -64,7 +64,7 @@ class Predictor(nn.Module):
         self.fc3_2 = nn.Linear(32, 16)
         self.fc3_3 = nn.Linear(16, 4)
         self.init_type = init_type
-        self._init_weights()
+        # self._init_weights()
 
     def _init_weights(self):
         if self.init_type == 'plane':

@@ -155,7 +155,7 @@ class PRSLoss(nn.Module):
     def forward(self, planes, quaternions, points_batch, nearest_idx_maps, nearest_pts_maps, max_min):
         Ds = self.Symmetry(planes, quaternions, points_batch, nearest_idx_maps, nearest_pts_maps, max_min)
         Dr = self.Regular(planes, quaternions)
-        return Ds 
+        return Ds + self.gamma * Dr
 
 
 # ===================== 测试 =====================

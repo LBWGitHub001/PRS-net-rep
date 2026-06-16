@@ -195,7 +195,7 @@ class UnifiedShapeNetProcessor:
                     points = points.astype(np.float32)
 
                 # 下采样结果
-                pc_centroid = points.mean(axis=0)
+                pc_centroid = full_points.mean(axis=0)
                 points = points - pc_centroid
                 min_gt = min_gt - pc_centroid
                 max_gt = max_gt - pc_centroid
@@ -484,7 +484,7 @@ if __name__ == '__main__':
         shapenet_root='ShapeNet',
         output_dir='./shapenet_intermediate',
         num_workers=None,  # 自动使用所有 CPU 核心
-        num_samples=1000
+        num_samples=3000
     )
 
     stats = processor.process_all(save_manifest=True)
